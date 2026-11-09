@@ -1,0 +1,9 @@
+Nearfield
+Copyright 2026 Ground State Foundry
+
+This product includes the DeepFilterNet3 model weights and architecture by Hendrik Schröter
+(https://github.com/Rikorose/DeepFilterNet), licensed under MIT OR Apache-2.0.
+MIT License, Copyright (c) 2021 Hendrik Schröter.
+
+The frame-by-frame streaming formulation of DeepFilterNet3 follows the torchDF port by grazder
+(https://github.com/grazder/DeepFilterNet), released under the same licenses.

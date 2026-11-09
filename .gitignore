@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+*.onnx
+dist/
+build/
+*.egg-info/
+release/
