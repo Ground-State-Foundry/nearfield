@@ -36,15 +36,28 @@ class Strength:
     far_db   cut applied to bands owned by the background
     gate_db  extra cut for whole frames where the near voice is silent (None = off)
     keep_db  bands owned by the near voice are never cut below this
+
+    talk_thr       ownership (averaged over talk_avg frames) above which the near voice is 'definitely talking';
+                   None switches the whole talk state off
+    talk_avg       frames (10 ms each) of averaging before that threshold, so short background bursts don't trigger it
+    talk_hold      frames the talk state is held after it last fired
+    talk_far_db    cut for background-owned bands while the talk state is held (instead of far_db)
+    talk_floor_db  while the talk state is held, no band is cut below this
     """
     k: float = 2.0
     far_db: float = -60.0
     gate_db: float | None = -45.0
     keep_db: float = -6.0
+    talk_thr: float | None = None
+    talk_avg: int = 10
+    talk_hold: int = 150
+    talk_far_db: float = -12.0
+    talk_floor_db: float = -8.0
 
 
 STRENGTHS = {
     "gentle": Strength(k=1.0, far_db=-20.0, gate_db=None),
+    "balanced": Strength(k=1.0, far_db=-60.0, gate_db=-45.0, talk_thr=0.6),
     "strong": Strength(k=1.0, far_db=-60.0, gate_db=-45.0),
     "full": Strength(k=2.0, far_db=-60.0, gate_db=-45.0),
 }
@@ -56,23 +69,43 @@ class _Rule:
         self.keep, self.far = 10 ** (s.keep_db / 20), 10 ** (s.far_db / 20)
         self.floor = None if s.gate_db is None else 10 ** (s.gate_db / 20)
         self.prev, self.hold = 0.0, 0
+        self.talk, self.talk_hold = 0.0, 0
+        self.hist = np.zeros(max(1, s.talk_avg))
+        self.talk_floor = 10 ** (s.talk_floor_db / 20)
 
     def __call__(self, xn: np.ndarray, xd: np.ndarray, own: np.ndarray) -> np.ndarray:
-        o = own if self.s.k == 1 else own ** self.s.k / (own ** self.s.k + (1 - own) ** self.s.k)
-        G = 1.0
-        if self.floor is not None:
+        s = self.s
+        o = own if s.k == 1 else own ** s.k / (own ** s.k + (1 - own) ** s.k)
+        G, far, talk = 1.0, self.far, 0.0
+        if self.floor is not None or s.talk_thr is not None:
             w = np.bincount(_BAND, weights=np.abs(xd) ** 2, minlength=32) + 1e-12
-            g0 = float(np.clip(((own * w).sum() / w.sum() - 0.25) / 0.35, 0, 1))
+            stat = float((own * w).sum() / w.sum())                # energy-weighted share of the frame owned by the near voice
+        if s.talk_thr is not None:
+            self.hist = np.roll(self.hist, -1)
+            self.hist[-1] = stat
+            t0 = float(np.clip((self.hist.mean() - s.talk_thr) / 0.3, 0, 1))
+            if t0 >= self.talk:
+                self.talk, self.talk_hold = t0, s.talk_hold
+            elif self.talk_hold > 0:
+                self.talk_hold -= 1
+            else:
+                self.talk = max(t0, self.talk * 0.9)
+            talk = self.talk
+            far = 10 ** ((s.far_db * (1 - talk) + s.talk_far_db * talk) / 20)
+        if self.floor is not None:
+            g0 = float(np.clip((stat - 0.25) / 0.35, 0, 1))
             if g0 >= self.prev:
                 self.prev, self.hold = g0, 15
             elif self.hold > 0:
                 self.hold -= 1
             else:
                 self.prev = max(g0, self.prev * 0.85)
-            G = self.floor + (1 - self.floor) * self.prev
+            G = self.floor + (1 - self.floor) * max(self.prev, talk)
         dg = np.clip(np.abs(xd) / (np.abs(xn) + 1e-9), 0, 1)
         ob = o[_BAND]
-        g = (ob * np.maximum(dg, self.keep) + (1 - ob) * np.minimum(dg, self.far)) * G
+        g = (ob * np.maximum(dg, self.keep) + (1 - ob) * np.minimum(dg, far)) * G
+        if talk > 0:
+            g = np.maximum(g, self.talk_floor * talk)
         return np.where(g >= dg - 1e-6, xn * g, xd * (g / (dg + 1e-9)))
 
 

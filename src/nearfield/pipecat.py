@@ -20,7 +20,7 @@ class NearfieldFilter(BaseAudioFilter):
     """Real-time near-voice filter for Pipecat transports.
 
     Args:
-        strength: "gentle", "strong" or "full" (default), or a custom ``nearfield.Strength``.
+        strength: "gentle", "balanced", "strong" or "full" (default), or a custom ``nearfield.Strength``.
         model_path: local weights file; by default they are downloaded once and cached.
     """
 

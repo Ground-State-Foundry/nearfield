@@ -30,7 +30,7 @@ transport = DailyTransport(
 )
 ```
 
-`NearfieldFilter(strength="full")` accepts `"gentle"`, `"strong"` or `"full"`. Send a `FilterEnableFrame(False)` to bypass it at runtime.
+`NearfieldFilter(strength="full")` accepts `"gentle"`, `"balanced"`, `"strong"` or `"full"`. Send a `FilterEnableFrame(False)` to bypass it at runtime.
 
 ## Use it directly
 
@@ -62,6 +62,23 @@ for chunk in mic_chunks_48k:          # any chunk size, float32
 | `full` (default) | −41 dB | 0.882 |
 
 Measured on 48 held-out simulated calls (unseen speakers and rooms) at 8, 16 and 48 kHz. While the caller is talking, background voices are reduced but can stay faintly audible when they overlap the caller in the same frequencies.
+
+### `balanced` (new in 1.1.0)
+
+`strong` can delete the caller's words when a background voice is about as loud as the caller: its whole-frame gate closes in the middle of a sentence. `balanced` adds a stricter "the caller is definitely talking" check. Once it fires, for the next 1.5 seconds the gate stays open, background-owned bands are cut by 12 dB instead of 60, and no band goes below −8 dB. Outside that window it behaves exactly like `strong`. Same model, same 30 ms latency.
+
+Share of the caller's words missing from the transcript (lower is better):
+
+| Setting | Clean | Steady noise | Quieter talker | Equal talker | Babble |
+|---|---|---|---|---|---|
+| No filter | 2.3% | 3.1% | 17.9% | 41.4% | 38.4% |
+| `gentle` | 2.6% | 3.3% | 8.8% | 30.9% | 40.3% |
+| `strong` | 2.7% | 5.1% | 20.1% | 47.0% | 60.6% |
+| `balanced` | 2.4% | 2.8% | 12.5% | 31.3% | 51.2% |
+
+Background-only clips that still reached the transcript (4+ words): `strong` 38% (talker) and 12% (babble), `balanced` 45% and 10%. 40 callers per condition through an 8 kHz phone channel, transcribed with Whisper large-v3-turbo; gaps under about 5 points are noise.
+
+The trade: for up to 1.5 s after the caller stops, background speech is turned down rather than removed (words that are not the caller's, against an equal talker: 2.6% with `strong`, 5.4% with `balanced`). With babble it still loses about half the caller's words, and a second person close to the phone is still treated as the caller.
 
 ## Weights
 
