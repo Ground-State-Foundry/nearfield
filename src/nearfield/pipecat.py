@@ -24,7 +24,7 @@ class NearfieldFilter(BaseAudioFilter):
             (volume levelling, tidying). See ``nearfield.Post``.
         model_path: a different weights file; by default the one inside the package is used.
 
-    The audio that comes back is 128 ms behind the audio that went in.
+    The audio that comes back is 48 ms behind the audio that went in.
     """
 
     def __init__(self, post: str | Post | None = "default", model_path: str | None = None) -> None:

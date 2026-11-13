@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-MODEL_FILE = "nearfield-v2.onnx"
-MODEL_SHA256 = "c442b6e87e0a84b0395be4dec208a508d8c876732c2845fb707e736762c01ea3"
+MODEL_FILE = "nearfield-v2.1.onnx"
+MODEL_SHA256 = "0e584ce9555fa645bb1cd3d8340cd7d0e843d4b5f2f283fd614aac2a66e08142"
 
 
 def model_path() -> str:

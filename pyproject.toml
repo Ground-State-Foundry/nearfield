@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nearfield"
-version = "2.0.0"
+version = "2.1.0"
 description = "Real-time caller voice isolation: keeps the near voice, removes noise and background voices."
 readme = "README.md"
 license = "Apache-2.0"

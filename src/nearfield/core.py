@@ -1,8 +1,8 @@
 """Nearfield v2 streaming runtime: keeps the voice close to the mic, removes noise and background voices.
 
 One small recurrent network, trained from scratch for this job, reads the call as a stream of short-time spectra
-(32 ms window, 8 ms hop, 16 kHz) and writes a complex mask for each one. It looks 96 ms ahead before it commits to a
-frame, so each output sample has seen 128 ms past it. A light post-processing stage then steadies the volume and
+(32 ms window, 8 ms hop, 16 kHz) and writes a complex mask for each one. It looks 16 ms ahead before it commits to a
+frame, so each output sample has seen 48 ms past it. A light post-processing stage then steadies the volume and
 tidies what is left. Everything runs on one CPU thread.
 """
 from __future__ import annotations
@@ -15,8 +15,8 @@ SR = 16000
 HOP = 128
 N_FFT = 512
 N_BINS = 257
-LOOKAHEAD_FRAMES = 12
-LATENCY_SAMPLES = N_FFT + LOOKAHEAD_FRAMES * HOP          # 2048 samples at 16 kHz = 128 ms
+LOOKAHEAD_FRAMES = 2
+LATENCY_SAMPLES = N_FFT + LOOKAHEAD_FRAMES * HOP          # 768 samples at 16 kHz = 48 ms
 _STATE_SHAPE = (4, 64, 128)
 
 
@@ -109,7 +109,7 @@ class Nearfield:
     >>> nf = Nearfield()
     >>> out = nf.process(chunk_16k_float32)    # any chunk size; returns the samples that are ready
 
-    Output sample i is the cleaned version of input sample i. Samples come out LATENCY_SAMPLES (128 ms) after
+    Output sample i is the cleaned version of input sample i. Samples come out LATENCY_SAMPLES (48 ms) after
     they went in, so early calls return fewer samples than they were given; flush() returns the rest.
 
     post: "default", "level", "none", or a custom ``Post``.
@@ -150,7 +150,7 @@ class Nearfield:
         self._buf = self._buf[n * HOP:]
         X = np.fft.rfft(fr, axis=1).astype(np.complex64)
         Xd = np.zeros_like(X)
-        for t in range(n):                                  # the model finishes the frame from 12 frames back
+        for t in range(n):                                  # the model finishes the frame from LOOKAHEAD_FRAMES back
             self._hist.append(X[t])
             if len(self._hist) > LOOKAHEAD_FRAMES:
                 Xd[t] = self._hist.pop(0)
