@@ -1,8 +1,9 @@
-"""Nearfield streaming runtime: keeps the voice close to the mic, removes noise and background voices.
+"""Nearfield v2 streaming runtime: keeps the voice close to the mic, removes noise and background voices.
 
-The ONNX model runs one 10 ms frame (480 samples at 48 kHz) at a time and returns, for the frame two steps back,
-the noise-suppressed spectrum and a per-band probability that the near (caller) voice owns that band. The keep/cut
-rule below turns that into the final spectrum. Latency is 30 ms (20 ms lookahead + one 10 ms hop).
+One small recurrent network, trained from scratch for this job, reads the call as a stream of short-time spectra
+(32 ms window, 8 ms hop, 16 kHz) and writes a complex mask for each one. It looks 96 ms ahead before it commits to a
+frame, so each output sample has seen 128 ms past it. A light post-processing stage then steadies the volume and
+tidies what is left. Everything runs on one CPU thread.
 """
 from __future__ import annotations
 
@@ -10,113 +11,111 @@ from dataclasses import dataclass
 
 import numpy as np
 
-SR = 48000
-HOP = 480
-N_FFT = 960
-N_BINS = 481
-LATENCY_SAMPLES = 3 * HOP                         # at 48 kHz
-
-_ERB_WIDTHS = [2] * 13 + [5, 5, 7, 7, 8, 10, 12, 13, 15, 18, 20, 24, 28, 31, 37, 42, 50, 56, 67]
-_BAND = np.repeat(np.arange(32), _ERB_WIDTHS)
-_STATE_LEN = 44728
-
-
-def initial_state() -> np.ndarray:
-    s = np.zeros(_STATE_LEN, np.float32)
-    s[:32] = np.linspace(-60.0, -90.0, 32)
-    s[32:128] = np.linspace(0.001, 0.0001, 96)
-    return s
+SR = 16000
+HOP = 128
+N_FFT = 512
+N_BINS = 257
+LOOKAHEAD_FRAMES = 12
+LATENCY_SAMPLES = N_FFT + LOOKAHEAD_FRAMES * HOP          # 2048 samples at 16 kHz = 128 ms
+_STATE_SHAPE = (4, 64, 128)
 
 
 @dataclass(frozen=True)
-class Strength:
-    """How hard to cut what isn't the near voice.
+class Post:
+    """What happens to the separated caller before it is returned. Every step works on the model's own output:
+    nothing from the original recording is mixed back in, and no step adds delay.
 
-    k        sharpening of the ownership decision (1 = as predicted)
-    far_db   cut applied to bands owned by the background
-    gate_db  extra cut for whole frames where the near voice is silent (None = off)
-    keep_db  bands owned by the near voice are never cut below this
-
-    talk_thr       ownership (averaged over talk_avg frames) above which the near voice is 'definitely talking';
-                   None switches the whole talk state off
-    talk_avg       frames (10 ms each) of averaging before that threshold, so short background bursts don't trigger it
-    talk_hold      frames the talk state is held after it last fired
-    talk_far_db    cut for background-owned bands while the talk state is held (instead of far_db)
-    talk_floor_db  while the talk state is held, no band is cut below this
+    level_db   volume levelling: speech is brought to about this loudness (dBFS) and peaks are limited.
+               Quiet callers are raised by up to 18 dB, loud ones lowered by up to 12 dB. None = leave the level alone.
+    blips      remove isolated leftovers: a frequency that is suddenly loud while its neighbours and its own
+               recent past are quiet.
+    pause_db   push the stretches between the caller's words down by up to this many dB, fading over about 80 ms.
+               None = off.
+    tilt_db    change above 5 kHz, easing in from 3 kHz (negative = softer top end). 0 = off.
     """
-    k: float = 2.0
-    far_db: float = -60.0
-    gate_db: float | None = -45.0
-    keep_db: float = -6.0
-    talk_thr: float | None = None
-    talk_avg: int = 10
-    talk_hold: int = 150
-    talk_far_db: float = -12.0
-    talk_floor_db: float = -8.0
+    level_db: float | None = -18.0
+    blips: bool = True
+    pause_db: float | None = 18.0
+    tilt_db: float = -5.0
 
 
-STRENGTHS = {
-    "gentle": Strength(k=1.0, far_db=-20.0, gate_db=None),
-    "balanced": Strength(k=1.0, far_db=-60.0, gate_db=-45.0, talk_thr=0.6),
-    "strong": Strength(k=1.0, far_db=-60.0, gate_db=-45.0),
-    "full": Strength(k=2.0, far_db=-60.0, gate_db=-45.0),
+POSTS = {
+    "default": Post(),
+    "level": Post(blips=False, pause_db=None, tilt_db=0.0),
+    "none": None,
 }
 
 
-class _Rule:
-    def __init__(self, s: Strength):
-        self.s = s
-        self.keep, self.far = 10 ** (s.keep_db / 20), 10 ** (s.far_db / 20)
-        self.floor = None if s.gate_db is None else 10 ** (s.gate_db / 20)
-        self.prev, self.hold = 0.0, 0
-        self.talk, self.talk_hold = 0.0, 0
-        self.hist = np.zeros(max(1, s.talk_avg))
-        self.talk_floor = 10 ** (s.talk_floor_db / 20)
+class _PostState:
+    def __init__(self, p: Post):
+        self.p = p
+        f = np.arange(N_BINS) * (SR / N_FFT)
+        self.tilt = 10 ** (p.tilt_db * np.clip((f - 3000.0) / 2000.0, 0, 1) / 20)
+        self.gp = np.zeros(N_BINS)
+        self.top, self.gate, self.hold = -60.0, 1.0, 0
+        self.lvl, self.gain = -26.0, 1.0
+        self.up, self.dn = 1 - np.exp(-8 / 150), 1 - np.exp(-8 / 3000)
+        self.rel = np.exp(-8 / 80)
 
-    def __call__(self, xn: np.ndarray, xd: np.ndarray, own: np.ndarray) -> np.ndarray:
-        s = self.s
-        o = own if s.k == 1 else own ** s.k / (own ** s.k + (1 - own) ** s.k)
-        G, far, talk = 1.0, self.far, 0.0
-        if self.floor is not None or s.talk_thr is not None:
-            w = np.bincount(_BAND, weights=np.abs(xd) ** 2, minlength=32) + 1e-12
-            stat = float((own * w).sum() / w.sum())                # energy-weighted share of the frame owned by the near voice
-        if s.talk_thr is not None:
-            self.hist = np.roll(self.hist, -1)
-            self.hist[-1] = stat
-            t0 = float(np.clip((self.hist.mean() - s.talk_thr) / 0.3, 0, 1))
-            if t0 >= self.talk:
-                self.talk, self.talk_hold = t0, s.talk_hold
-            elif self.talk_hold > 0:
-                self.talk_hold -= 1
-            else:
-                self.talk = max(t0, self.talk * 0.9)
-            talk = self.talk
-            far = 10 ** ((s.far_db * (1 - talk) + s.talk_far_db * talk) / 20)
-        if self.floor is not None:
-            g0 = float(np.clip((stat - 0.25) / 0.35, 0, 1))
-            if g0 >= self.prev:
-                self.prev, self.hold = g0, 15
+    def spec(self, Y: np.ndarray, X: np.ndarray) -> np.ndarray:
+        """Y: separated spectrum of one frame, X: the input spectrum of the same frame."""
+        p = self.p
+        s = self.tilt
+        if p.blips:
+            g = np.minimum(2.0, np.abs(Y) / (np.abs(X) + 1e-9))
+            gl, gr = np.concatenate([g[:1], g[:-1]]), np.concatenate([g[1:], g[-1:]])
+            pl, pr = np.concatenate([self.gp[:1], self.gp[:-1]]), np.concatenate([self.gp[1:], self.gp[-1:]])
+            ref = np.maximum.reduce([pl, self.gp, pr, gl, gr]) * 1.5 + 0.03
+            s = np.where(g > ref, s * ref / np.maximum(g, 1e-9), s)
+            self.gp = g
+        Y = Y * s
+        if p.pause_db:
+            e = float((Y.real ** 2 + Y.imag ** 2).sum())
+            db = 10 * np.log10(e / (N_FFT * N_FFT * 0.375) * 2 + 1e-12)
+            self.top = db if db > self.top else self.top - 0.004
+            thr = max(-70.0, self.top - 32.0)
+            want = 1.0
+            if db >= thr:
+                self.hold = 12
             elif self.hold > 0:
                 self.hold -= 1
             else:
-                self.prev = max(g0, self.prev * 0.85)
-            G = self.floor + (1 - self.floor) * max(self.prev, talk)
-        dg = np.clip(np.abs(xd) / (np.abs(xn) + 1e-9), 0, 1)
-        ob = o[_BAND]
-        g = (ob * np.maximum(dg, self.keep) + (1 - ob) * np.minimum(dg, far)) * G
-        if talk > 0:
-            g = np.maximum(g, self.talk_floor * talk)
-        return np.where(g >= dg - 1e-6, xn * g, xd * (g / (dg + 1e-9)))
+                want = 10 ** (max(-p.pause_db, db - thr) / 20)
+            self.gate = want if want >= self.gate else self.gate * self.rel + want * (1 - self.rel)
+            if self.gate < 1:
+                Y = Y * self.gate
+        return Y
+
+    def time(self, y: np.ndarray) -> np.ndarray:
+        """One hop of output samples, levelled in place."""
+        p = self.p
+        if p.level_db is None or len(y) == 0:
+            return y
+        db = 10 * np.log10(float(np.mean(y * y)) + 1e-12)
+        if db > max(-55.0, self.lvl - 25.0):
+            self.lvl += (self.up if db > self.lvl else self.dn) * (db - self.lvl)
+        want = 10 ** (min(18.0, max(-12.0, p.level_db - self.lvl)) / 20)
+        g1 = self.gain + (want - self.gain) * 0.08
+        v = y * (self.gain + (g1 - self.gain) * np.arange(len(y)) / len(y))
+        a = np.abs(v)
+        v = np.where(a > 0.5, np.sign(v) * (0.5 + 0.45 * np.tanh((a - 0.5) / 0.45)), v)
+        self.gain = g1
+        return v
 
 
 class Nearfield:
-    """Streaming cleaner at 48 kHz.
+    """Streaming cleaner at 16 kHz.
 
-    >>> nf = Nearfield()                       # downloads the weights once
-    >>> out = nf.process(chunk_48k_float32)    # any chunk size; returns whole 10 ms frames
+    >>> nf = Nearfield()
+    >>> out = nf.process(chunk_16k_float32)    # any chunk size; returns the samples that are ready
+
+    Output sample i is the cleaned version of input sample i. Samples come out LATENCY_SAMPLES (128 ms) after
+    they went in, so early calls return fewer samples than they were given; flush() returns the rest.
+
+    post: "default", "level", "none", or a custom ``Post``.
     """
 
-    def __init__(self, model_path: str | None = None, strength: str | Strength = "full", threads: int = 1):
+    def __init__(self, model_path: str | None = None, post: str | Post | None = "default", threads: int = 1):
         import onnxruntime as ort
         from .weights import model_path as _default_path
 
@@ -124,63 +123,86 @@ class Nearfield:
         opts.intra_op_num_threads = threads
         opts.inter_op_num_threads = 1
         self._sess = ort.InferenceSession(model_path or _default_path(), opts, providers=["CPUExecutionProvider"])
-        self._strength = STRENGTHS[strength] if isinstance(strength, str) else strength
-        w = np.sin(0.5 * np.pi * (np.arange(N_FFT) + 0.5) / HOP)
-        self._win = np.sin(0.5 * np.pi * w ** 2)
-        self._wnorm = 1.0 / (N_FFT ** 2 / (2 * HOP))
+        self._post_cfg = POSTS[post] if isinstance(post, str) else post
+        self._win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)
         self.reset()
 
     def reset(self) -> None:
-        self._state = initial_state()
-        self._amem = np.zeros(HOP, np.float32)
-        self._smem = np.zeros(HOP)
-        self._hist = [np.zeros(N_BINS, np.complex64), np.zeros(N_BINS, np.complex64)]
-        self._buf = np.zeros(0, np.float32)
-        self._rule = _Rule(self._strength)
-        self.last_own = np.zeros(32, np.float32)
+        self._state = np.zeros(_STATE_SHAPE, np.float32)
+        self._buf = np.zeros(N_FFT // 2, np.float32)
+        self._hist: list[np.ndarray] = []
+        self._ola = np.zeros(N_FFT)
+        self._skip = N_FFT // 2
+        self._frames = 0
+        self._n_in = 0
+        self._n_out = 0
+        self._post = _PostState(self._post_cfg) if self._post_cfg is not None else None
 
-    def set_strength(self, strength: str | Strength) -> None:
-        self._strength = STRENGTHS[strength] if isinstance(strength, str) else strength
-        self._rule = _Rule(self._strength)
+    def set_post(self, post: str | Post | None) -> None:
+        self._post_cfg = POSTS[post] if isinstance(post, str) else post
+        self._post = _PostState(self._post_cfg) if self._post_cfg is not None else None
 
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """One 480-sample frame at 48 kHz in, one out (delayed by LATENCY_SAMPLES)."""
-        X = np.fft.rfft(np.concatenate([self._amem, frame]) * self._win) * self._wnorm
-        self._amem = np.asarray(frame, np.float32)
-        spec = np.stack([X.real, X.imag], -1).astype(np.float32)
-        _, y_dfn, own, self._state = self._sess.run(None, {"spec": spec, "state": self._state})
-        xn = self._hist.pop(0)
-        self._hist.append(X.astype(np.complex64))
-        xd = y_dfn[:, 0] + 1j * y_dfn[:, 1]
-        self.last_own = own
-        Y = self._rule(xn, xd, own)
-        x = np.fft.irfft(Y, N_FFT) * N_FFT * self._win
-        out = x[:HOP] + self._smem
-        self._smem = x[HOP:]
-        return out.astype(np.float32)
-
-    def process(self, audio: np.ndarray) -> np.ndarray:
-        """Feed any number of 48 kHz float samples; returns all completed output frames."""
-        self._buf = np.concatenate([self._buf, np.asarray(audio, np.float32)])
-        n = len(self._buf) // HOP
+    def _run(self) -> np.ndarray:
+        n = (len(self._buf) - N_FFT) // HOP + 1 if len(self._buf) >= N_FFT else 0
         if n == 0:
             return np.zeros(0, np.float32)
-        out = [self.process_frame(self._buf[i * HOP:(i + 1) * HOP]) for i in range(n)]
+        fr = np.stack([self._buf[t * HOP:t * HOP + N_FFT] for t in range(n)]) * self._win
         self._buf = self._buf[n * HOP:]
-        return np.concatenate(out)
+        X = np.fft.rfft(fr, axis=1).astype(np.complex64)
+        Xd = np.zeros_like(X)
+        for t in range(n):                                  # the model finishes the frame from 12 frames back
+            self._hist.append(X[t])
+            if len(self._hist) > LOOKAHEAD_FRAMES:
+                Xd[t] = self._hist.pop(0)
+        ri = lambda Z: np.stack([Z.real, Z.imag], -1).astype(np.float32)
+        y, self._state = self._sess.run(None, {"x": ri(X), "xd": ri(Xd), "state": self._state})
+        Y = y[..., 0] + 1j * y[..., 1]
+        out = []
+        for t in range(n):
+            self._frames += 1
+            if self._frames <= LOOKAHEAD_FRAMES:
+                continue
+            Yt = self._post.spec(Y[t], Xd[t]) if self._post is not None else Y[t]
+            self._ola += np.fft.irfft(Yt, N_FFT) * self._win
+            hop = self._ola[:HOP] / 1.5
+            self._ola = np.concatenate([self._ola[HOP:], np.zeros(HOP)])
+            if self._skip:
+                d = min(self._skip, HOP)
+                hop = hop[d:]
+                self._skip -= d
+            out.append(self._post.time(hop) if self._post is not None else hop)
+        return np.concatenate(out).astype(np.float32) if out else np.zeros(0, np.float32)
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        """Feed any number of 16 kHz float samples; returns the cleaned samples that are ready."""
+        audio = np.asarray(audio, np.float32)
+        self._n_in += len(audio)
+        self._buf = np.concatenate([self._buf, audio])
+        y = self._run()
+        self._n_out += len(y)
+        return y
 
     def flush(self) -> np.ndarray:
-        """Push silence through so the last LATENCY_SAMPLES of real audio come out."""
-        pad = (-len(self._buf)) % HOP + LATENCY_SAMPLES
-        return self.process(np.zeros(pad, np.float32))
+        """Push silence through so the samples still inside come out. After this, as many samples have come out as went in."""
+        want = self._n_in - self._n_out
+        self._buf = np.concatenate([self._buf, np.zeros(LATENCY_SAMPLES + N_FFT + (-len(self._buf)) % HOP, np.float32)])
+        y = self._run()[:max(0, want)]
+        self._n_out += len(y)
+        return y
 
 
-def clean(audio: np.ndarray, sample_rate: int, strength: str = "full", model_path: str | None = None) -> np.ndarray:
-    """Clean a whole recording (mono float). Returns audio at the same rate and length, latency removed."""
+def clean(audio: np.ndarray, sample_rate: int, post: str | Post | None = "default", model_path: str | None = None) -> np.ndarray:
+    """Clean a whole recording (mono float). Returns audio at the same rate and length, time-aligned with the input.
+
+    The model works at 16 kHz, so the result carries sound up to 8 kHz whatever rate it is returned at.
+    """
     import soxr
 
     x = np.asarray(audio, np.float32)
-    x48 = soxr.resample(x, sample_rate, SR) if sample_rate != SR else x
-    nf = Nearfield(model_path, strength)
-    y = np.concatenate([nf.process(x48), nf.flush()])[LATENCY_SAMPLES: LATENCY_SAMPLES + len(x48)]
-    return soxr.resample(y, SR, sample_rate).astype(np.float32) if sample_rate != SR else y
+    x16 = soxr.resample(x, sample_rate, SR) if sample_rate != SR else x
+    nf = Nearfield(model_path, post)
+    y = np.concatenate([nf.process(x16), nf.flush()])
+    if sample_rate == SR:
+        return y
+    y = soxr.resample(y, SR, sample_rate).astype(np.float32)
+    return np.concatenate([y, np.zeros(max(0, len(x) - len(y)), np.float32)])[:len(x)]

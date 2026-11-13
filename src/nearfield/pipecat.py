@@ -3,7 +3,7 @@
     from nearfield.pipecat import NearfieldFilter
     transport = SomeTransport(params=TransportParams(audio_in_filter=NearfieldFilter()))
 
-Follows Pipecat's RNNoiseFilter: resamples to 48 kHz, processes 10 ms frames, resamples back.
+Follows Pipecat's RNNoiseFilter: resamples to 16 kHz, cleans, resamples back.
 """
 from __future__ import annotations
 
@@ -13,19 +13,22 @@ from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import FilterControlFrame, FilterEnableFrame
 
-from .core import SR, Nearfield, Strength
+from .core import SR, Nearfield, Post
 
 
 class NearfieldFilter(BaseAudioFilter):
     """Real-time near-voice filter for Pipecat transports.
 
     Args:
-        strength: "gentle", "balanced", "strong" or "full" (default), or a custom ``nearfield.Strength``.
-        model_path: local weights file; by default they are downloaded once and cached.
+        post: "default", "level" or "none", or a custom ``nearfield.Post``: what is done to the separated caller
+            (volume levelling, tidying). See ``nearfield.Post``.
+        model_path: a different weights file; by default the one inside the package is used.
+
+    The audio that comes back is 128 ms behind the audio that went in.
     """
 
-    def __init__(self, strength: str | Strength = "full", model_path: str | None = None) -> None:
-        self._strength, self._model_path = strength, model_path
+    def __init__(self, post: str | Post | None = "default", model_path: str | None = None) -> None:
+        self._post, self._model_path = post, model_path
         self._filtering = True
         self._sample_rate = 0
         self._nf: Nearfield | None = None
@@ -35,7 +38,7 @@ class NearfieldFilter(BaseAudioFilter):
     async def start(self, sample_rate: int):
         self._sample_rate = sample_rate
         try:
-            self._nf = Nearfield(self._model_path, self._strength)
+            self._nf = Nearfield(self._model_path, self._post)
         except Exception as e:
             logger.error(f"Failed to initialize Nearfield: {e}")
             self._nf = None

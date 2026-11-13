@@ -1,9 +1,7 @@
 Nearfield
 Copyright 2026 Ground State Foundry
 
-This product includes the DeepFilterNet3 model weights and architecture by Hendrik Schröter
-(https://github.com/Rikorose/DeepFilterNet), licensed under MIT OR Apache-2.0.
-MIT License, Copyright (c) 2021 Hendrik Schröter.
+Nearfield v2 (this version) contains no third-party model. The model and its weights are by Ground State Foundry.
 
-The frame-by-frame streaming formulation of DeepFilterNet3 follows the torchDF port by grazder
-(https://github.com/grazder/DeepFilterNet), released under the same licenses.
+Nearfield v1 (tags v1.0.0 and v1.1.0) includes the DeepFilterNet3 model weights and architecture by Hendrik Schröter
+(https://github.com/Rikorose/DeepFilterNet), licensed under MIT OR Apache-2.0; see the NOTICE file at those tags.

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 *.onnx
+!src/nearfield/nearfield-v2.onnx
 dist/
 build/
 *.egg-info/
