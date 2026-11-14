@@ -23,12 +23,13 @@ class NearfieldFilter(BaseAudioFilter):
         post: "default", "level" or "none", or a custom ``nearfield.Post``: what is done to the separated caller
             (volume levelling, tidying). See ``nearfield.Post``.
         model_path: a different weights file; by default the one inside the package is used.
+        model: "fast" (the default) or "best".
 
-    The audio that comes back is 48 ms behind the audio that went in.
+    The audio that comes back is 48 ms behind the audio that went in with "fast", 80 ms with "best".
     """
 
-    def __init__(self, post: str | Post | None = "default", model_path: str | None = None) -> None:
-        self._post, self._model_path = post, model_path
+    def __init__(self, post: str | Post | None = "default", model_path: str | None = None, model: str | None = None) -> None:
+        self._post, self._model_path, self._model = post, model_path, model
         self._filtering = True
         self._sample_rate = 0
         self._nf: Nearfield | None = None
@@ -38,7 +39,7 @@ class NearfieldFilter(BaseAudioFilter):
     async def start(self, sample_rate: int):
         self._sample_rate = sample_rate
         try:
-            self._nf = Nearfield(self._model_path, self._post)
+            self._nf = Nearfield(self._model_path, self._post, model=self._model)
         except Exception as e:
             logger.error(f"Failed to initialize Nearfield: {e}")
             self._nf = None

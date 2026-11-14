@@ -1,9 +1,13 @@
 """Nearfield v2 streaming runtime: keeps the voice close to the mic, removes noise and background voices.
 
 One small recurrent network, trained from scratch for this job, reads the call as a stream of short-time spectra
-(32 ms window, 8 ms hop, 16 kHz) and writes a complex mask for each one. It looks 16 ms ahead before it commits to a
-frame, so each output sample has seen 48 ms past it. A light post-processing stage then steadies the volume and
-tidies what is left. Everything runs on one CPU thread.
+(32 ms window, 8 ms hop, 16 kHz) and writes a complex mask for each one. It looks a little ahead before it commits
+to a frame. There are two sets of weights, same size and same speed:
+
+    "fast"  looks 16 ms ahead: 48 ms of delay. The default.
+    "best"  looks 48 ms ahead: 80 ms of delay, and keeps more of the caller when other people are talking.
+
+A light post-processing stage then steadies the volume and tidies what is left. Everything runs on one CPU thread.
 """
 from __future__ import annotations
 
@@ -15,8 +19,15 @@ SR = 16000
 HOP = 128
 N_FFT = 512
 N_BINS = 257
-LOOKAHEAD_FRAMES = 2
-LATENCY_SAMPLES = N_FFT + LOOKAHEAD_FRAMES * HOP          # 768 samples at 16 kHz = 48 ms
+MODELS = {"fast": 2, "best": 6}                           # frames of look-ahead (8 ms each)
+LOOKAHEAD_FRAMES = MODELS["fast"]
+LATENCY_SAMPLES = N_FFT + LOOKAHEAD_FRAMES * HOP          # the default model: 768 samples at 16 kHz = 48 ms
+
+
+def latency_samples(model: str = "fast") -> int:
+    """Delay of a model in samples at 16 kHz: 768 (48 ms) for "fast", 1280 (80 ms) for "best"."""
+    return N_FFT + MODELS[model] * HOP
+
 _STATE_SHAPE = (4, 64, 128)
 
 
@@ -109,20 +120,34 @@ class Nearfield:
     >>> nf = Nearfield()
     >>> out = nf.process(chunk_16k_float32)    # any chunk size; returns the samples that are ready
 
-    Output sample i is the cleaned version of input sample i. Samples come out LATENCY_SAMPLES (48 ms) after
-    they went in, so early calls return fewer samples than they were given; flush() returns the rest.
+    Output sample i is the cleaned version of input sample i. Samples come out ``latency_samples`` after they
+    went in (48 ms for "fast", 80 ms for "best"), so early calls return fewer samples than they were given;
+    flush() returns the rest.
 
-    post: "default", "level", "none", or a custom ``Post``.
+    model: "fast" (48 ms of delay, the default) or "best" (80 ms, keeps more of the caller over other voices).
+           The NEARFIELD_QUALITY environment variable sets it when the argument is left out.
+    post:  "default", "level", "none", or a custom ``Post``.
+    model_path: a different weights file for the chosen model; by default the one inside the package is used.
     """
 
-    def __init__(self, model_path: str | None = None, post: str | Post | None = "default", threads: int = 1):
+    def __init__(self, model_path: str | None = None, post: str | Post | None = "default", threads: int = 1,
+                 model: str | None = None):
+        import os
+
         import onnxruntime as ort
         from .weights import model_path as _default_path
+
+        model = model or os.environ.get("NEARFIELD_QUALITY") or "fast"
+        if model not in MODELS:
+            raise ValueError(f"model must be one of {sorted(MODELS)}, got {model!r}")
+        self.model = model
+        self._look = MODELS[model]
+        self.latency_samples = N_FFT + self._look * HOP
 
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = threads
         opts.inter_op_num_threads = 1
-        self._sess = ort.InferenceSession(model_path or _default_path(), opts, providers=["CPUExecutionProvider"])
+        self._sess = ort.InferenceSession(model_path or _default_path(model), opts, providers=["CPUExecutionProvider"])
         self._post_cfg = POSTS[post] if isinstance(post, str) else post
         self._win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)
         self.reset()
@@ -150,9 +175,9 @@ class Nearfield:
         self._buf = self._buf[n * HOP:]
         X = np.fft.rfft(fr, axis=1).astype(np.complex64)
         Xd = np.zeros_like(X)
-        for t in range(n):                                  # the model finishes the frame from LOOKAHEAD_FRAMES back
+        for t in range(n):                                  # the model finishes the frame from `look` frames back
             self._hist.append(X[t])
-            if len(self._hist) > LOOKAHEAD_FRAMES:
+            if len(self._hist) > self._look:
                 Xd[t] = self._hist.pop(0)
         ri = lambda Z: np.stack([Z.real, Z.imag], -1).astype(np.float32)
         y, self._state = self._sess.run(None, {"x": ri(X), "xd": ri(Xd), "state": self._state})
@@ -160,7 +185,7 @@ class Nearfield:
         out = []
         for t in range(n):
             self._frames += 1
-            if self._frames <= LOOKAHEAD_FRAMES:
+            if self._frames <= self._look:
                 continue
             Yt = self._post.spec(Y[t], Xd[t]) if self._post is not None else Y[t]
             self._ola += np.fft.irfft(Yt, N_FFT) * self._win
@@ -185,22 +210,23 @@ class Nearfield:
     def flush(self) -> np.ndarray:
         """Push silence through so the samples still inside come out. After this, as many samples have come out as went in."""
         want = self._n_in - self._n_out
-        self._buf = np.concatenate([self._buf, np.zeros(LATENCY_SAMPLES + N_FFT + (-len(self._buf)) % HOP, np.float32)])
+        self._buf = np.concatenate([self._buf, np.zeros(self.latency_samples + N_FFT + (-len(self._buf)) % HOP, np.float32)])
         y = self._run()[:max(0, want)]
         self._n_out += len(y)
         return y
 
 
-def clean(audio: np.ndarray, sample_rate: int, post: str | Post | None = "default", model_path: str | None = None) -> np.ndarray:
+def clean(audio: np.ndarray, sample_rate: int, post: str | Post | None = "default", model_path: str | None = None,
+          model: str | None = None) -> np.ndarray:
     """Clean a whole recording (mono float). Returns audio at the same rate and length, time-aligned with the input.
 
-    The model works at 16 kHz, so the result carries sound up to 8 kHz whatever rate it is returned at.
+    model: "fast" (the default) or "best". The model works at 16 kHz, so the result carries sound up to 8 kHz whatever rate it is returned at.
     """
     import soxr
 
     x = np.asarray(audio, np.float32)
     x16 = soxr.resample(x, sample_rate, SR) if sample_rate != SR else x
-    nf = Nearfield(model_path, post)
+    nf = Nearfield(model_path, post, model=model)
     y = np.concatenate([nf.process(x16), nf.flush()])
     if sample_rate == SR:
         return y
