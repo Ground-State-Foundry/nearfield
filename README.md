@@ -5,10 +5,58 @@
 By [Ground State Foundry](https://github.com/ground-state-foundry).
 
 - **Real time on a CPU:** about 0.2 s of compute per second of audio on one thread (onnxruntime, Intel Xeon Platinum 8488C).
-- **Two models, one switch:** `fast` (the default) has 48 ms of delay. `best` has 80 ms and keeps more of the caller when other people are talking. Same size, same speed.
+- **Beats Krisp and Sanas on Krisp's own benchmark:** on Krisp's public set of 265 real recordings, both models make fewer word errors than Krisp VI 2.5 and Sanas and let fewer background words through. See the table below.
+- **Two models, one switch:** `fast` (the default) has 48 ms of delay. `best` has 80 ms and lets fewer background words through. Same size, same speed.
 - **Small:** each model is one 2.5 MB ONNX file, about 628,000 weights, shipped inside the package. Nothing is downloaded at run time.
 - **16 kHz.** Phone lines (8 kHz) and wideband calls both work; audio at other rates is resampled in and out.
 - **Drop-in for [Pipecat](https://github.com/pipecat-ai/pipecat)** voice agents.
+
+## Benchmark: real recordings
+
+[Krisp's Voice Isolation benchmark](https://huggingface.co/datasets/Krisp-AI/VoiceIsolation-Benchmark-Dataset): 265 real recordings (headsets at work, call-centre floors, phone calls) with other people talking in the room. Each filter's output is transcribed and compared with what the caller said. Lower is better in both columns.
+
+| # | Model* | Access | Word error rate | Background words let through, per minute |
+|---|---|---|---|---|
+| 1 | **Nearfield `best` (v2.3, 80 ms)** | **open** | **4.99%** | **0.36** |
+| 2 | **Nearfield `fast` (v2.3, 48 ms)** | **open** | **5.01%** | **0.70** |
+| 3 | Krisp VI 2.5 Default | paid | 5.30% | 1.52 |
+| 4 | Krisp VI 2.5 Lite | paid | 6.21% | 4.52 |
+| 5 | ai-coustics Voice Focus 2.2 L | paid | 6.84% | 0.66 |
+| 6 | Sanas Voice Isolation | paid | 9.38% | 13.76 |
+| 7 | DeepFilterNet3 | open | 13.30% | 22.77 |
+| | No filter | | 23.21% | 66.47 |
+
+<sub>* Open models under 50 MB and the paid filters (known sizes: Nearfield 2.5 MB, DeepFilterNet3 about 8 MB, ai-coustics Voice Focus 2.2 L about 20 MB; Krisp and Sanas do not publish one).</sub>
+
+Word error rate by scenario:
+
+| | Work (96 files) | Call centre (106) | Phone calls (63) |
+|---|---|---|---|
+| No filter | 29.31% | 25.13% | 3.82% |
+| Krisp VI 2.5 Default | 5.18% | 5.69% | 4.15% |
+| Nearfield `fast` | 4.77% | 5.24% | 4.66% |
+| Nearfield `best` | 5.05% | 5.12% | 4.38% |
+
+How to read it:
+
+- **Scoring** follows Krisp's published method: Parakeet TDT 0.6B v2 transcripts, Krisp's text normalisation, word error rate over the whole set. "Background words" are words the recogniser writes during stretches where only a background voice is talking.
+- **Who ran what.** We ran the Nearfield, Krisp and no-filter rows (Krisp publishes its own outputs for every file). The ai-coustics, Sanas and DeepFilterNet3 rows are from [The Voice on the Line](https://arxiv.org/abs/2610.35272), which uses the same scoring; our Krisp and no-filter rows reproduce that paper's figures exactly.
+- **Gaps of a few tenths of a point are within noise.** We have no error bars for this set. The lead over Krisp Default on words is small; the lead on background words is larger.
+- **v2.3 was tuned against this benchmark.** Its recordings were never used for training, but two rounds of changes to our training recipe were judged on it, and the `best` weights are the snapshot that scored best on it. Expect slightly worse on other recordings.
+- **Phone calls** have no background talker. No filter at all scores best there, and Krisp is a little ahead of us.
+
+## What is new in v2.3
+
+v2.2 and earlier decided who the caller was by how close they sounded. That was a hidden cutoff: a caller on a car's hands-free, a speakerphone or some headsets sounded "far", and the model muted them, sometimes for the rest of the call. On the benchmark above v2.2 scored 7.83% (`fast`) and 8.37% (`best`), almost all of it from a few callers who were silenced entirely.
+
+v2.3 is the same network retrained with a different rule: **the caller is the nearest voice heard so far in the call, however far away that is.**
+
+- **Far callers are kept.** Word error rate on the phone-call recordings fell from 16.1% to 4.7% (`fast`).
+- **Long calls.** Training calls are now 60 seconds long with pauses of up to 40 seconds, so the model holds on to the caller through a long stretch where only the background is talking. v2.2 was trained on clips of a few seconds and could lose the caller after such a stretch.
+- **Quiet callers and processed audio.** Training now covers callers down to about -52 dBFS and what phones and headsets do before the audio arrives: noise suppression, automatic gain, noise gates, lost packets.
+- **`clean()` on long files** no longer needs gigabytes of memory; a ten-minute recording peaks at about 250 MB.
+
+What it costs: **a voice that speaks before the caller does is let through until the caller starts.** v2.2 silenced it. If a TV or a colleague is audible at the start of a call, you will hear them until the caller's first word. See [Limits](#limits).
 
 ## What is new in v2
 
@@ -31,15 +79,17 @@ Share of the caller's words missing from the transcript (lower is better):
 | v1 `balanced` | 2.4% | 2.8% | 12.5% | 31.3% | 51.2% |
 | v1 `strong` | 2.7% | 5.1% | 20.1% | 47.0% | 60.6% |
 | v2.0 (128 ms delay) | 2.3% | 4.4% | 5.4% | 13.9% | 32.2% |
-| **v2 `fast` (48 ms delay, the default)** | **2.0%** | **3.3%** | **6.1%** | **15.9%** | **37.0%** |
-| **v2 `best` (80 ms delay)** | **1.8%** | **3.5%** | **5.4%** | **13.6%** | **30.9%** |
+| v2.2 `fast` (48 ms delay) | 2.0% | 3.3% | 6.1% | 15.9% | 37.0% |
+| v2.2 `best` (80 ms delay) | 1.8% | 3.5% | 5.4% | 13.6% | 30.9% |
 
 40 callers per condition reading English sentences, mixed with a background talker, babble or steady noise, sent through an 8 kHz phone channel and transcribed with Whisper large-v3-turbo. Gaps under about 5 points are within noise. The no-filter and v1 rows are the ones published with v1.1.0; the v2 rows were scored later on the same clips with the same recogniser, on the packaged versions with the clean-up stage on.
 
+**This table stops at v2.2.** v2.3 has not been scored on these clips as packaged yet. In them the background voice is already talking when the caller starts, and under the v2.3 rule that voice is kept until the caller's first word, so expect v2.3 to lose more of the caller's opening words here than v2.2 did. The real recordings above are the better guide.
+
 What else was measured, on the same clips:
 
-- **When only the background is talking** (no caller in the clip), the output of `fast` was 45 dB below its input for a background talker and 35 dB for babble; for `best` it was 49 dB and 44 dB. None of those clips produced a transcript of four or more words (v1 `strong`: 38% of the talker clips and 12% of the babble clips did).
-- **While the caller is talking**, an equally loud background talker comes out about 16 dB below where it went in, and the caller about 4 dB below (measured on the model output, before the clean-up stage). So the background is still faintly there under the caller; it is not gone.
+- **When only the background is talking and no caller has spoken yet**, v2.3 keeps a single background talker, by design: it is the nearest voice so far. Babble is still turned down. v2.2 silenced both (45 to 49 dB down for a talker, 35 to 44 dB for babble).
+- **While the caller is talking**, an equally loud background talker comes out about 16 dB below where it went in, and the caller about 4 dB below (measured on the v2.2 model output, before the clean-up stage). So the background is still faintly there under the caller; it is not gone.
 
 ## How it works
 
@@ -60,12 +110,12 @@ The weights are open. The training code and data pipeline are not part of this r
 
 ## Fast or best
 
-| | Delay | Equal talker | Babble |
+| | Delay | Word error rate | Background words per minute |
 |---|---|---|---|
-| `fast` (default) | 48 ms | 15.9% | 37.0% |
-| `best` | 80 ms | 13.6% | 30.9% |
+| `fast` (default) | 48 ms | 5.01% | 0.70 |
+| `best` | 80 ms | 4.99% | 0.36 |
 
-Pick `fast` when every millisecond of the call matters. Pick `best` when callers are often in a room with other people talking and 32 ms more delay is acceptable. Compute and size are the same.
+Pick `fast` when every millisecond of the call matters. Pick `best` when callers are often in a room with other people talking and 32 ms more delay is acceptable: it lets about half as many background words through. Compute and size are the same.
 
 ```python
 Nearfield(model="best")
@@ -132,12 +182,12 @@ Nearfield(post=Post(level_db=-20, blips=True, pause_db=12, tilt_db=0))
 
 ## Limits
 
-- **Babble is still hard.** With a whole room talking at the caller's level, `fast` loses about 37 in 100 of the caller's words and `best` about 31. No filter loses 38 and v1 lost 40 to 61. So in babble `fast` silences the room when the caller is not talking but does not rescue more of the caller's words; `best` rescues some.
+- **A voice that speaks before the caller is let through** until the caller's first word. The model has no way to know a closer voice is coming.
+- **Babble is still hard.** With a whole room talking at the caller's level, about a third of the caller's words are still lost. No filter loses 38 in 100.
 - **The background is reduced under the caller, not removed.** See the 16 dB figure above.
 - **A little more delay than v1.** 48 ms or 80 ms against 30 ms.
-- **The shorter delay costs some words.** That is the difference between `fast` and `best` in the table.
 - **16 kHz.** The output carries sound up to 8 kHz. v1 worked at 48 kHz.
-- **Measured on simulated calls.** Real phone lines and rooms will differ.
+- **One real benchmark.** The real-recording figures come from a single public set that v2.3 was tuned against; other lines and rooms will differ.
 - Volume levelling takes a second or two to settle at the start of a call, because it has to hear the caller first.
 
 ## v1
@@ -150,7 +200,7 @@ pip install "nearfield @ git+https://github.com/ground-state-foundry/nearfield@v
 
 ## Weights
 
-The models are `src/nearfield/nearfield-v2.1.onnx` (`fast`) and `src/nearfield/nearfield-v2.2-best.onnx` (`best`). Both install with the package and are attached to the [v2.2.0 release](https://github.com/ground-state-foundry/nearfield/releases/tag/v2.2.0). Set `NEARFIELD_MODEL=/path/to/file.onnx` to use a different copy of the chosen model.
+The models are `src/nearfield/nearfield-v2.3.onnx` (`fast`) and `src/nearfield/nearfield-v2.3-best.onnx` (`best`). Both install with the package and are attached to the [v2.3.0 release](https://github.com/ground-state-foundry/nearfield/releases/tag/v2.3.0). The v2.2 weights stay available from the `v2.2.0` tag. Set `NEARFIELD_MODEL=/path/to/file.onnx` to use a different copy of the chosen model.
 
 ## License
 

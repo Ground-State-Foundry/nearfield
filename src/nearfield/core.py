@@ -202,8 +202,11 @@ class Nearfield:
         """Feed any number of 16 kHz float samples; returns the cleaned samples that are ready."""
         audio = np.asarray(audio, np.float32)
         self._n_in += len(audio)
-        self._buf = np.concatenate([self._buf, audio])
-        y = self._run()
+        out = []
+        for i in range(0, max(len(audio), 1), SR):          # at most one second per model call: memory stays flat however long the input is
+            self._buf = np.concatenate([self._buf, audio[i:i + SR]])
+            out.append(self._run())
+        y = np.concatenate(out)
         self._n_out += len(y)
         return y
 

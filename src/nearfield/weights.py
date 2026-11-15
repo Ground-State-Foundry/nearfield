@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-MODEL_FILES = {"fast": "nearfield-v2.1.onnx", "best": "nearfield-v2.2-best.onnx"}
+MODEL_FILES = {"fast": "nearfield-v2.3.onnx", "best": "nearfield-v2.3-best.onnx"}
 MODEL_SHA256 = {
-    "fast": "0e584ce9555fa645bb1cd3d8340cd7d0e843d4b5f2f283fd614aac2a66e08142",
-    "best": "3a64ed4d3be788644b40dcf441152cbc2d66076f88220c66e837ae425cfbc0d4",
+    "fast": "d3634c3c12fc9c320f10d1665cf50910565852222d2e2c601e3acf9c04250d7c",
+    "best": "ce966bc8c050c7a6cbbdab4b2fc831b4e19df259ea8a6bc1d2c0cf90e3c2053f",
 }
 MODEL_FILE = MODEL_FILES["fast"]
 
