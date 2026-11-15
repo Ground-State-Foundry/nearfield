@@ -81,14 +81,16 @@ Share of the caller's words missing from the transcript (lower is better):
 | v2.0 (128 ms delay) | 2.3% | 4.4% | 5.4% | 13.9% | 32.2% |
 | v2.2 `fast` (48 ms delay) | 2.0% | 3.3% | 6.1% | 15.9% | 37.0% |
 | v2.2 `best` (80 ms delay) | 1.8% | 3.5% | 5.4% | 13.6% | 30.9% |
+| **v2.3 `fast` (48 ms delay, the default)** | **2.0%** | **3.3%** | **6.8%** | **19.7%** | **35.9%** |
+| **v2.3 `best` (80 ms delay)** | **2.4%** | **4.3%** | **7.2%** | **17.3%** | **34.6%** |
 
 40 callers per condition reading English sentences, mixed with a background talker, babble or steady noise, sent through an 8 kHz phone channel and transcribed with Whisper large-v3-turbo. Gaps under about 5 points are within noise. The no-filter and v1 rows are the ones published with v1.1.0; the v2 rows were scored later on the same clips with the same recogniser, on the packaged versions with the clean-up stage on.
 
-**This table stops at v2.2.** v2.3 has not been scored on these clips as packaged yet. In them the background voice is already talking when the caller starts, and under the v2.3 rule that voice is kept until the caller's first word, so expect v2.3 to lose more of the caller's opening words here than v2.2 did. The real recordings above are the better guide.
+**v2.3 scores worse than v2.2 on this test.** In these clips the background voice is already talking when the caller starts, and under the v2.3 rule that voice is kept until the caller's first word. Against an equally loud talker, v2.3 `fast` loses the caller's first word in 25% of clips where v2.2 lost it in 10%. The real recordings above, where v2.3 is well ahead, are the better guide to a live call.
 
 What else was measured, on the same clips:
 
-- **When only the background is talking and no caller has spoken yet**, v2.3 keeps a single background talker, by design: it is the nearest voice so far. Babble is still turned down. v2.2 silenced both (45 to 49 dB down for a talker, 35 to 44 dB for babble).
+- **When only the background is talking and no caller has spoken yet**, v2.3 keeps a single background talker, by design: it is the nearest voice so far. Nearly all of those clips produce a transcript. Babble with no caller is turned down only a little (11 dB for `fast`, 5 dB for `best`, before volume levelling), and 32% and 50% of those clips still produce a transcript of four or more words. v2.2 silenced both (45 to 49 dB down for a talker, 35 to 44 dB for babble).
 - **While the caller is talking**, an equally loud background talker comes out about 16 dB below where it went in, and the caller about 4 dB below (measured on the v2.2 model output, before the clean-up stage). So the background is still faintly there under the caller; it is not gone.
 
 ## How it works
@@ -183,7 +185,7 @@ Nearfield(post=Post(level_db=-20, blips=True, pause_db=12, tilt_db=0))
 ## Limits
 
 - **A voice that speaks before the caller is let through** until the caller's first word. The model has no way to know a closer voice is coming.
-- **Babble is still hard.** With a whole room talking at the caller's level, about a third of the caller's words are still lost. No filter loses 38 in 100.
+- **Babble is still hard.** With a whole room talking at the caller's level, about 35 in 100 of the caller's words are still lost. No filter loses 38. And a room of babble with no caller yet is no longer silenced.
 - **The background is reduced under the caller, not removed.** See the 16 dB figure above.
 - **A little more delay than v1.** 48 ms or 80 ms against 30 ms.
 - **16 kHz.** The output carries sound up to 8 kHz. v1 worked at 48 kHz.
